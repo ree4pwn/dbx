@@ -2575,7 +2575,7 @@ impl AppState {
         if let Some(database) = self.resolve_legacy_postgres_like_database(connection_id, &db_config).await {
             db_config.database = Some(database);
         }
-        if db_config.db_type != DatabaseType::Plugin {
+        if db_config.db_type != DatabaseType::Plugin && runtime_proxy.is_none() {
             probe_connection_endpoint(&db_config, &host, port).await?;
         }
         if let Err(err) = self.ensure_current_connection_attempt(connection_id, connection_attempt).await {
@@ -2822,12 +2822,13 @@ impl AppState {
             DatabaseType::ClickHouse => {
                 let username = if db_config.username.is_empty() { None } else { Some(db_config.username.clone()) };
                 let password = if db_config.password.is_empty() { None } else { Some(db_config.password.clone()) };
-                let client = db::clickhouse_driver::ChClient::new_with_ca_cert(
+                let client = db::clickhouse_driver::ChClient::new_with_ca_cert_and_proxy(
                     &url,
                     username,
                     password,
                     Some(&db_config.ca_cert_path),
                     db_config.url_params.as_deref(),
+                    clickhouse_http_proxy(runtime_proxy.as_ref())?,
                     connect_timeout,
                 )?;
                 db::clickhouse_driver::test_connection(&client, connect_timeout).await?;
@@ -3446,6 +3447,11 @@ impl AppState {
         if transport_layers.is_empty() || db::sqlite_worker::sqlite_remote_worker_requested(config) {
             return Ok(ConnectionEndpoint::direct(config.host.clone(), config.port));
         }
+        if config.db_type == DatabaseType::ClickHouse {
+            if let Some(proxy) = self.clickhouse_proxy_for_transport_layers(connection_id, &transport_layers).await? {
+                return Ok(ConnectionEndpoint { host: config.host.clone(), port: config.port, proxy: Some(proxy) });
+            }
+        }
         if config.uses_oracle_tns() {
             // A TNS descriptor may contain several failover addresses, so rewriting it
             // through one local tunnel endpoint would silently break Oracle Net routing.
@@ -3498,6 +3504,43 @@ impl AppState {
         .await?;
 
         Ok(ConnectionEndpoint { host: "127.0.0.1".to_string(), port: local_port, proxy: None })
+    }
+
+    async fn clickhouse_proxy_for_transport_layers(
+        &self,
+        connection_id: &str,
+        transport_layers: &[TransportLayerConfig],
+    ) -> Result<Option<PluginRuntimeProxy>, String> {
+        use crate::models::connection::ProxyType;
+
+        let Some(TransportLayerConfig::Proxy(proxy)) = transport_layers.last() else {
+            return self.socks5_route_for_transport_layers(connection_id, transport_layers).await;
+        };
+        if proxy.proxy_type == ProxyType::Socks5 {
+            return self.socks5_route_for_transport_layers(connection_id, transport_layers).await;
+        }
+        let (host, port) = if transport_layers.len() == 1 {
+            (proxy.host.clone(), proxy.port)
+        } else {
+            let local_port = db::transport_layer_tunnel::start_transport_layers(
+                connection_id,
+                &transport_layers[..transport_layers.len() - 1],
+                &proxy.host,
+                proxy.port,
+                &self.tunnels,
+                &self.proxy_tunnels,
+                &self.http_tunnels,
+            )
+            .await?;
+            ("127.0.0.1".to_string(), local_port)
+        };
+        Ok(Some(PluginRuntimeProxy {
+            proxy_type: "http".to_string(),
+            host,
+            port,
+            username: proxy.username.clone(),
+            password: proxy.password.clone(),
+        }))
     }
 
     /// Builds the host-managed SOCKS5 route from the transport chain for
@@ -6745,6 +6788,28 @@ pub fn connection_url_for_endpoint(config: &ConnectionConfig, host: &str, port: 
     } else {
         config.connection_url_with_host(host, port)
     }
+}
+
+fn clickhouse_http_proxy(proxy: Option<&PluginRuntimeProxy>) -> Result<Option<reqwest::Proxy>, String> {
+    let Some(proxy) = proxy else {
+        return Ok(None);
+    };
+    let scheme = match proxy.proxy_type.as_str() {
+        "socks5" => "socks5h",
+        "http" => "http",
+        _ => return Err("Unsupported ClickHouse proxy type".to_string()),
+    };
+    let host = if proxy.host.contains(':') && !proxy.host.starts_with('[') {
+        format!("[{}]", proxy.host)
+    } else {
+        proxy.host.clone()
+    };
+    let mut http_proxy = reqwest::Proxy::all(format!("{scheme}://{host}:{}", proxy.port))
+        .map_err(|error| format!("Invalid ClickHouse proxy address: {error}"))?;
+    if !proxy.username.is_empty() || !proxy.password.is_empty() {
+        http_proxy = http_proxy.basic_auth(&proxy.username, &proxy.password);
+    }
+    Ok(Some(http_proxy))
 }
 
 pub fn redacted_connection_url_for_endpoint(config: &ConnectionConfig, host: &str, port: u16) -> String {
@@ -10754,6 +10819,64 @@ for line in sys.stdin:
         }
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn clickhouse_proxy_endpoint_preserves_https_authority() {
+        let (state, dir) = test_app_state().await;
+        let mut config = mysql_config(None);
+        config.db_type = DatabaseType::ClickHouse;
+        config.host = "clickhouse.proxy.test".to_string();
+        config.port = 8443;
+        config.ssl = true;
+
+        for (proxy_type, expected_type) in [(ProxyType::Socks5, "socks5"), (ProxyType::Http, "http")] {
+            config.transport_layers = vec![TransportLayerConfig::Proxy(ProxyTunnelConfig {
+                id: "proxy".to_string(),
+                name: String::new(),
+                enabled: true,
+                proxy_type,
+                host: "127.0.0.1".to_string(),
+                port: 65000,
+                username: "proxy:user".to_string(),
+                password: "p@ss/word#".to_string(),
+                test_target: None,
+                profile_id: String::new(),
+            })];
+
+            let endpoint = state.connection_endpoint("proxied-clickhouse", &config).await.unwrap();
+            assert_eq!(endpoint.host, config.host);
+            assert_eq!(endpoint.port, config.port);
+            assert_eq!(
+                connection_url_for_endpoint(&config, &endpoint.host, endpoint.port),
+                "https://clickhouse.proxy.test:8443"
+            );
+            let proxy = endpoint.proxy.unwrap();
+            assert_eq!(proxy.proxy_type, expected_type);
+            assert_eq!(proxy.host, "127.0.0.1");
+            assert_eq!(proxy.port, 65000);
+            assert_eq!(proxy.username, "proxy:user");
+            assert_eq!(proxy.password, "p@ss/word#");
+            assert!(clickhouse_http_proxy(Some(&proxy)).unwrap().is_some());
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn clickhouse_http_proxy_accepts_ipv6_and_rejects_unknown_protocols() {
+        for host in ["::1", "[::1]"] {
+            let proxy = PluginRuntimeProxy::socks5(host.to_string(), 1080, String::new(), String::new());
+            assert!(clickhouse_http_proxy(Some(&proxy)).unwrap().is_some());
+        }
+        assert!(clickhouse_http_proxy(None).unwrap().is_none());
+        let proxy = PluginRuntimeProxy {
+            proxy_type: "unsupported".to_string(),
+            host: "localhost".to_string(),
+            port: 1080,
+            username: String::new(),
+            password: String::new(),
+        };
+        assert!(clickhouse_http_proxy(Some(&proxy)).is_err());
     }
 
     #[tokio::test]

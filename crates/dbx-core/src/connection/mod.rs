@@ -7003,9 +7003,9 @@ async fn detect_ob_oracle_mode(config: &ConnectionConfig, pool: &db::mysql::MySq
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_connect_timeout, connection_configs_pool_equivalent, connection_configs_session_credentials_compatible,
-        connection_probe_endpoints, connection_remote_endpoint, connection_url_for_endpoint,
-        database_connection_config, database_connection_config_with_catalog,
+        agent_connect_timeout, clickhouse_http_proxy, connection_configs_pool_equivalent,
+        connection_configs_session_credentials_compatible, connection_probe_endpoints, connection_remote_endpoint,
+        connection_url_for_endpoint, database_connection_config, database_connection_config_with_catalog,
         gaussdb_identifier_quote_from_query_result, gaussdb_m_jdbc_config_for_endpoint, gaussdb_uses_m_jdbc_driver,
         kafka_single_loopback_bootstrap_endpoint, keepalive_failure_proves_pool_dead, metadata_connection_config,
         metadata_pool_database, mysql_metadata_fallback_url, mysql_pool_setup_queries, oceanbase_mysql_setup_queries,
@@ -7027,6 +7027,7 @@ mod tests {
         default_connect_timeout_secs, default_redis_key_separator, AttachedDatabaseConfig, ConnectionConfig,
         DatabaseType, HttpTunnelConfig, ProxyTunnelConfig, ProxyType, SshTunnelConfig, TransportLayerConfig,
     };
+    use crate::plugins::PluginRuntimeProxy;
     use crate::query;
     use crate::schema;
     use std::sync::Arc;
@@ -10877,6 +10878,107 @@ for line in sys.stdin:
             password: String::new(),
         };
         assert!(clickhouse_http_proxy(Some(&proxy)).is_err());
+    }
+
+    #[tokio::test]
+    async fn clickhouse_proxy_chain_preserves_final_proxy_and_database_authority() {
+        let (state, dir) = test_app_state().await;
+        let mut config = mysql_config(None);
+        config.db_type = DatabaseType::ClickHouse;
+        config.host = "clickhouse.proxy.test".to_string();
+        config.port = 8443;
+        config.ssl = true;
+        for (proxy_type, expected_type) in [(ProxyType::Socks5, "socks5"), (ProxyType::Http, "http")] {
+            let mut first = proxy_layer("first", "");
+            first.host = "127.0.0.1".to_string();
+            first.port = 65001;
+            let mut last = proxy_layer("last", "");
+            last.proxy_type = proxy_type;
+            last.host = "last.proxy.test".to_string();
+            last.port = 65000;
+            last.username = "final-user".to_string();
+            last.password = "final-password".to_string();
+            config.transport_layers = vec![TransportLayerConfig::Proxy(first), TransportLayerConfig::Proxy(last)];
+            let endpoint = state.connection_endpoint("clickhouse-chain", &config).await.unwrap();
+            assert_eq!(endpoint.host, config.host);
+            assert_eq!(endpoint.port, config.port);
+            let proxy = endpoint.proxy.unwrap();
+            assert_eq!(proxy.proxy_type, expected_type);
+            assert_eq!(proxy.host, "127.0.0.1");
+            assert_ne!(proxy.port, 0);
+            assert_ne!(proxy.port, 65000);
+            assert_eq!(proxy.username, "final-user");
+            assert_eq!(proxy.password, "final-password");
+            state.proxy_tunnels.stop_tunnel("clickhouse-chain:transport:0").await;
+        }
+        state.shutdown(Duration::from_secs(5)).await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn clickhouse_proxy_pool_does_not_require_direct_dns_or_tcp_access() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (state, dir) = test_app_state().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut greeting = [0_u8; 2];
+            socket.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting[0], 5);
+            let mut methods = vec![0_u8; greeting[1] as usize];
+            socket.read_exact(&mut methods).await.unwrap();
+            assert!(methods.contains(&0));
+            socket.write_all(&[5, 0]).await.unwrap();
+            let mut connect = [0_u8; 5];
+            socket.read_exact(&mut connect).await.unwrap();
+            assert_eq!(&connect[..4], &[5, 1, 0, 3]);
+            let mut hostname = vec![0_u8; connect[4] as usize];
+            socket.read_exact(&mut hostname).await.unwrap();
+            assert_eq!(hostname.as_slice(), b"clickhouse.proxy.invalid");
+            let mut port = [0_u8; 2];
+            socket.read_exact(&mut port).await.unwrap();
+            assert_eq!(u16::from_be_bytes(port), 8123);
+            socket.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0_u8; 1];
+                socket.read_exact(&mut byte).await.unwrap();
+                request.extend_from_slice(&byte);
+            }
+            let request = String::from_utf8(request).unwrap();
+            assert!(request.starts_with("GET /?query=SELECT%201 "));
+            assert!(request.lines().any(|line| line.eq_ignore_ascii_case("host: clickhouse.proxy.invalid:8123")));
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n1\n").await.unwrap();
+        });
+        let mut config = mysql_config(None);
+        config.id = "clickhouse-proxy-pool".to_string();
+        config.db_type = DatabaseType::ClickHouse;
+        config.host = "clickhouse.proxy.invalid".to_string();
+        config.port = 8123;
+        config.ssl = false;
+        config.transport_layers = vec![TransportLayerConfig::Proxy(ProxyTunnelConfig {
+            id: "proxy".to_string(),
+            name: String::new(),
+            enabled: true,
+            proxy_type: ProxyType::Socks5,
+            host: "127.0.0.1".to_string(),
+            port: proxy_port,
+            username: String::new(),
+            password: String::new(),
+            test_target: None,
+            profile_id: String::new(),
+        })];
+        state.configs.write().await.insert(config.id.clone(), config);
+        let result =
+            tokio::time::timeout(Duration::from_secs(10), state.get_or_create_pool("clickhouse-proxy-pool", None))
+                .await
+                .unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        tokio::time::timeout(Duration::from_secs(10), server).await.unwrap().unwrap();
+        state.shutdown(Duration::from_secs(5)).await;
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

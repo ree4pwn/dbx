@@ -6790,7 +6790,7 @@ pub fn connection_url_for_endpoint(config: &ConnectionConfig, host: &str, port: 
     }
 }
 
-fn clickhouse_http_proxy(proxy: Option<&PluginRuntimeProxy>) -> Result<Option<reqwest::Proxy>, String> {
+pub fn clickhouse_http_proxy(proxy: Option<&PluginRuntimeProxy>) -> Result<Option<reqwest::Proxy>, String> {
     let Some(proxy) = proxy else {
         return Ok(None);
     };
